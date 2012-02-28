@@ -2,6 +2,7 @@
  *  Gmux driver for Apple laptops
  *
  *  Copyright (C) Canonical Ltd. <seth.forshee@canonical.com>
+ *  Copyright (C) 2010-2012 Andreas Heider <andreas@meetr.de>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2 as
@@ -16,6 +17,8 @@
 #include <linux/backlight.h>
 #include <linux/acpi.h>
 #include <linux/pnp.h>
+#include <linux/pci.h>
+#include <linux/vga_switcheroo.h>
 
 struct apple_gmux_data {
 	unsigned long iostart;
@@ -23,6 +26,11 @@ struct apple_gmux_data {
 
 	struct backlight_device *bdev;
 };
+
+/* TODO: remove hack */
+static struct apple_gmux_data *gmux_sdata;
+
+DECLARE_COMPLETION(powerchange_done);
 
 /*
  * gmux port offsets. Many of these are not yet used, but may be in the
@@ -97,6 +105,120 @@ static int gmux_update_status(struct backlight_device *bd)
 	return 0;
 }
 
+static int gmux_switchto(enum vga_switcheroo_client_id id)
+{
+	if (id == VGA_SWITCHEROO_IGD) {
+		gmux_write8(gmux_sdata, GMUX_PORT_SWITCH_DDC, 1);
+		gmux_write8(gmux_sdata, GMUX_PORT_SWITCH_DISPLAY, 2);
+		gmux_write8(gmux_sdata, GMUX_PORT_SWITCH_EXTERNAL, 2);
+	} else {
+		gmux_write8(gmux_sdata, GMUX_PORT_SWITCH_DDC, 2);
+		gmux_write8(gmux_sdata, GMUX_PORT_SWITCH_DISPLAY, 3);
+		gmux_write8(gmux_sdata, GMUX_PORT_SWITCH_EXTERNAL, 3);
+	}
+
+	return 0;
+}
+
+static int gmux_set_discrete_state(enum vga_switcheroo_state state)
+{
+	/* TODO: locking for completions needed? */
+	init_completion(&powerchange_done);
+
+	if (state == VGA_SWITCHEROO_ON) {
+		gmux_write8(gmux_sdata, GMUX_PORT_DISCRETE_POWER, 1);
+		gmux_write8(gmux_sdata, GMUX_PORT_DISCRETE_POWER, 3);
+		pr_info("discrete powered up\n");
+	} else {
+		gmux_write8(gmux_sdata, GMUX_PORT_DISCRETE_POWER, 0);
+		pr_info("discrete powered down\n");
+	}
+
+	/* TODO: add timeout */
+	pr_info("before completion\n");
+    wait_for_completion(&powerchange_done);
+	pr_info("after completion\n");
+
+	return 0;
+}
+
+static int gmux_set_power_state(enum vga_switcheroo_client_id id,
+				enum vga_switcheroo_state state)
+{
+	if (id == VGA_SWITCHEROO_IGD)
+		return 0;
+
+	return gmux_set_discrete_state(state);
+}
+
+static int gmux_init(void)
+{
+	return 0;
+}
+
+static int gmux_get_client_id(struct pci_dev *pdev)
+{
+	if (pdev->vendor == 0x8086) /* TODO: better detection, see bbswitch */
+		return VGA_SWITCHEROO_IGD;
+	else
+		return VGA_SWITCHEROO_DIS;
+}
+
+static struct vga_switcheroo_handler gmux_handler = {
+	.switchto = gmux_switchto,
+	.power_state = gmux_set_power_state,
+	.init = gmux_init,
+	.get_client_id = gmux_get_client_id,
+};
+
+static void gmux_disable_interrupts(void)
+{
+	gmux_write8(gmux_sdata, GMUX_PORT_INTERRUPT_ENABLE, GMUX_INTERRUPT_DISABLE);
+}
+
+static void gmux_enable_interrupts(void)
+{
+	gmux_write8(gmux_sdata, GMUX_PORT_INTERRUPT_ENABLE, GMUX_INTERRUPT_ENABLE);
+}
+
+static int gmux_interrupt_get_status(void)
+{
+	return gmux_read8(gmux_sdata, GMUX_PORT_INTERRUPT_STATUS);
+}
+
+static void gmux_interrupt_activate_status(void)
+{
+	int old_status;
+	int new_status;
+	
+	/* to reactivate interrupts write back current status */
+	old_status = gmux_interrupt_get_status();
+	gmux_write8(gmux_sdata, GMUX_PORT_INTERRUPT_STATUS, old_status);
+	new_status = gmux_interrupt_get_status();
+	
+	/* status = 0 indicates active interrupts */
+	if (new_status)
+		pr_info("gmux: error: activate_status, old_status %d new_status %d\n", old_status, new_status);
+}
+
+static u32 gmux_gpe_handler(acpi_handle gpe_device, u32 gpe_number, void *context)
+{
+	int status;
+
+	status = gmux_interrupt_get_status();
+	gmux_disable_interrupts();
+	pr_info("gmux: gpe handler called: status %d\n", status);
+
+	gmux_interrupt_activate_status();
+	gmux_enable_interrupts();
+	
+	/* TODO: & */
+	if (status == GMUX_INTERRUPT_STATUS_POWER)
+		complete(&powerchange_done);
+
+	return 0;
+}
+
 static const struct backlight_ops gmux_bl_ops = {
 	.get_brightness = gmux_get_brightness,
 	.update_status = gmux_update_status,
@@ -110,6 +232,8 @@ static int __devinit gmux_probe(struct pnp_dev *pnp,
 	struct backlight_properties props;
 	struct backlight_device *bdev;
 	u8 ver_major, ver_minor, ver_release;
+	acpi_handle dhandle;
+	acpi_status status;
 	int ret = -ENXIO;
 
 	gmux_data = kzalloc(sizeof(*gmux_data), GFP_KERNEL);
@@ -179,8 +303,45 @@ static int __devinit gmux_probe(struct pnp_dev *pnp,
 	bdev->props.brightness = gmux_get_brightness(bdev);
 	backlight_update_status(bdev);
 
+	dhandle = pnp_acpi_device(pnp);
+	if (!dhandle) {
+		pr_err("Cannot find acpi device for pnp device %s\n", dev_name(&pnp->dev));
+		goto err_release;
+	} else {
+		struct acpi_buffer buf = { ACPI_ALLOCATE_BUFFER, NULL };
+		acpi_get_name(dhandle, ACPI_FULL_PATHNAME, &buf);
+		pr_info("Found acpi handle for pnp device %s: %s\n", 
+			dev_name(&pnp->dev), (char *)buf.pointer);
+		kfree(buf.pointer);
+	}
+
+    /* TODO: use dhandle? */
+	status = acpi_install_gpe_handler(NULL, 0x16, ACPI_GPE_LEVEL_TRIGGERED, &gmux_gpe_handler, dhandle);
+	if (ACPI_FAILURE(status)) {
+		printk("Install gpe handler failed: %s\n", acpi_format_exception(status));
+		goto err_release;
+	}
+
+	status = acpi_enable_gpe(NULL, 0x16);
+	if (ACPI_FAILURE(status)) {
+		pr_err("Enable gpe failed: %s\n", acpi_format_exception(status));
+		goto err_enable_gpe;
+	}
+
+	/* HACK */
+	gmux_sdata = gmux_data;
+	
+	if (vga_switcheroo_register_handler(&gmux_handler))
+		goto err_switcheroo;
+
+	gmux_enable_interrupts();
+
 	return 0;
 
+err_switcheroo:
+	acpi_remove_gpe_handler(NULL, 0x16, &gmux_gpe_handler);
+err_enable_gpe:
+	backlight_device_unregister(bdev);
 err_release:
 	release_region(gmux_data->iostart, gmux_data->iolen);
 err_free:
@@ -192,7 +353,11 @@ static void __devexit gmux_remove(struct pnp_dev *pnp)
 {
 	struct apple_gmux_data *gmux_data = pnp_get_drvdata(pnp);
 
+	vga_switcheroo_unregister_handler();
 	backlight_device_unregister(gmux_data->bdev);
+	gmux_disable_interrupts();
+	acpi_remove_gpe_handler(NULL, 0x16, &gmux_gpe_handler);
+	acpi_disable_gpe(NULL, 0x16);
 	release_region(gmux_data->iostart, gmux_data->iolen);
 	kfree(gmux_data);
 }
