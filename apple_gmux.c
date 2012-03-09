@@ -20,15 +20,13 @@
 #include <linux/pci.h>
 #include <linux/vga_switcheroo.h>
 
-struct apple_gmux_data {
+static struct apple_gmux_data {
 	unsigned long iostart;
 	unsigned long iolen;
+	acpi_handle dhandle;
 
 	struct backlight_device *bdev;
-};
-
-/* TODO: remove hack */
-static struct apple_gmux_data *gmux_sdata;
+} gmux_data;
 
 DECLARE_COMPLETION(powerchange_done);
 
@@ -63,32 +61,29 @@ DECLARE_COMPLETION(powerchange_done);
 #define GMUX_BRIGHTNESS_MASK		0x00ffffff
 #define GMUX_MAX_BRIGHTNESS		GMUX_BRIGHTNESS_MASK
 
-static inline u8 gmux_read8(struct apple_gmux_data *gmux_data, int port)
+static inline u8 gmux_read8(int port)
 {
-	return inb(gmux_data->iostart + port);
+	return inb(gmux_data.iostart + port);
 }
 
-static inline void gmux_write8(struct apple_gmux_data *gmux_data, int port,
-			       u8 val)
+static inline void gmux_write8(int port, u8 val)
 {
-	outb(val, gmux_data->iostart + port);
+	outb(val, gmux_data.iostart + port);
 }
 
-static inline u32 gmux_read32(struct apple_gmux_data *gmux_data, int port)
+static inline u32 gmux_read32(int port)
 {
-	return inl(gmux_data->iostart + port);
+	return inl(gmux_data.iostart + port);
 }
 
 static int gmux_get_brightness(struct backlight_device *bd)
 {
-	struct apple_gmux_data *gmux_data = bl_get_data(bd);
-	return gmux_read32(gmux_data, GMUX_PORT_BRIGHTNESS) &
+	return gmux_read32(GMUX_PORT_BRIGHTNESS) &
 	       GMUX_BRIGHTNESS_MASK;
 }
 
 static int gmux_update_status(struct backlight_device *bd)
 {
-	struct apple_gmux_data *gmux_data = bl_get_data(bd);
 	u32 brightness = bd->props.brightness;
 
 	/*
@@ -97,10 +92,10 @@ static int gmux_update_status(struct backlight_device *bd)
 	 * accept a single u32 write, but the old method also works, so we
 	 * just use the old method for all gmux versions.
 	 */
-	gmux_write8(gmux_data, GMUX_PORT_BRIGHTNESS, brightness);
-	gmux_write8(gmux_data, GMUX_PORT_BRIGHTNESS + 1, brightness >> 8);
-	gmux_write8(gmux_data, GMUX_PORT_BRIGHTNESS + 2, brightness >> 16);
-	gmux_write8(gmux_data, GMUX_PORT_BRIGHTNESS + 3, 0);
+	gmux_write8(GMUX_PORT_BRIGHTNESS, brightness);
+	gmux_write8(GMUX_PORT_BRIGHTNESS + 1, brightness >> 8);
+	gmux_write8(GMUX_PORT_BRIGHTNESS + 2, brightness >> 16);
+	gmux_write8(GMUX_PORT_BRIGHTNESS + 3, 0);
 
 	return 0;
 }
@@ -108,13 +103,13 @@ static int gmux_update_status(struct backlight_device *bd)
 static int gmux_switchto(enum vga_switcheroo_client_id id)
 {
 	if (id == VGA_SWITCHEROO_IGD) {
-		gmux_write8(gmux_sdata, GMUX_PORT_SWITCH_DDC, 1);
-		gmux_write8(gmux_sdata, GMUX_PORT_SWITCH_DISPLAY, 2);
-		gmux_write8(gmux_sdata, GMUX_PORT_SWITCH_EXTERNAL, 2);
+		gmux_write8(GMUX_PORT_SWITCH_DDC, 1);
+		gmux_write8(GMUX_PORT_SWITCH_DISPLAY, 2);
+		gmux_write8(GMUX_PORT_SWITCH_EXTERNAL, 2);
 	} else {
-		gmux_write8(gmux_sdata, GMUX_PORT_SWITCH_DDC, 2);
-		gmux_write8(gmux_sdata, GMUX_PORT_SWITCH_DISPLAY, 3);
-		gmux_write8(gmux_sdata, GMUX_PORT_SWITCH_EXTERNAL, 3);
+		gmux_write8(GMUX_PORT_SWITCH_DDC, 2);
+		gmux_write8(GMUX_PORT_SWITCH_DISPLAY, 3);
+		gmux_write8(GMUX_PORT_SWITCH_EXTERNAL, 3);
 	}
 
 	return 0;
@@ -126,18 +121,17 @@ static int gmux_set_discrete_state(enum vga_switcheroo_state state)
 	init_completion(&powerchange_done);
 
 	if (state == VGA_SWITCHEROO_ON) {
-		gmux_write8(gmux_sdata, GMUX_PORT_DISCRETE_POWER, 1);
-		gmux_write8(gmux_sdata, GMUX_PORT_DISCRETE_POWER, 3);
-		pr_info("discrete powered up\n");
+		gmux_write8(GMUX_PORT_DISCRETE_POWER, 1);
+		gmux_write8(GMUX_PORT_DISCRETE_POWER, 3);
+		pr_info("discrete card powered up\n");
 	} else {
-		gmux_write8(gmux_sdata, GMUX_PORT_DISCRETE_POWER, 0);
-		pr_info("discrete powered down\n");
+		gmux_write8(GMUX_PORT_DISCRETE_POWER, 1);
+		gmux_write8(GMUX_PORT_DISCRETE_POWER, 0);
+		pr_info("discrete card powered down\n");
 	}
 
-	/* TODO: add timeout */
-	pr_info("before completion\n");
-    wait_for_completion(&powerchange_done);
-	pr_info("after completion\n");
+	if (wait_for_completion_interruptible_timeout(&powerchange_done, msecs_to_jiffies(200)))
+		pr_info("completion timeout, \n");
 
 	return 0;
 }
@@ -173,17 +167,17 @@ static struct vga_switcheroo_handler gmux_handler = {
 
 static void gmux_disable_interrupts(void)
 {
-	gmux_write8(gmux_sdata, GMUX_PORT_INTERRUPT_ENABLE, GMUX_INTERRUPT_DISABLE);
+	gmux_write8(GMUX_PORT_INTERRUPT_ENABLE, GMUX_INTERRUPT_DISABLE);
 }
 
 static void gmux_enable_interrupts(void)
 {
-	gmux_write8(gmux_sdata, GMUX_PORT_INTERRUPT_ENABLE, GMUX_INTERRUPT_ENABLE);
+	gmux_write8(GMUX_PORT_INTERRUPT_ENABLE, GMUX_INTERRUPT_ENABLE);
 }
 
 static int gmux_interrupt_get_status(void)
 {
-	return gmux_read8(gmux_sdata, GMUX_PORT_INTERRUPT_STATUS);
+	return gmux_read8(GMUX_PORT_INTERRUPT_STATUS);
 }
 
 static void gmux_interrupt_activate_status(void)
@@ -192,16 +186,16 @@ static void gmux_interrupt_activate_status(void)
 	int new_status;
 	
 	/* to reactivate interrupts write back current status */
-	old_status = gmux_interrupt_get_status();
-	gmux_write8(gmux_sdata, GMUX_PORT_INTERRUPT_STATUS, old_status);
-	new_status = gmux_interrupt_get_status();
+	old_status = gmux_read8(GMUX_PORT_INTERRUPT_STATUS);
+	gmux_write8(GMUX_PORT_INTERRUPT_STATUS, old_status);
+	new_status = gmux_read8(GMUX_PORT_INTERRUPT_STATUS);
 	
 	/* status = 0 indicates active interrupts */
 	if (new_status)
 		pr_info("gmux: error: activate_status, old_status %d new_status %d\n", old_status, new_status);
 }
 
-static u32 gmux_gpe_handler(acpi_handle gpe_device, u32 gpe_number, void *context)
+static void gmux_notify_handler(acpi_handle device, u32 value, void *context)
 {
 	int status;
 
@@ -212,11 +206,8 @@ static u32 gmux_gpe_handler(acpi_handle gpe_device, u32 gpe_number, void *contex
 	gmux_interrupt_activate_status();
 	gmux_enable_interrupts();
 	
-	/* TODO: & */
-	if (status == GMUX_INTERRUPT_STATUS_POWER)
+	if (status & GMUX_INTERRUPT_STATUS_POWER)
 		complete(&powerchange_done);
-
-	return 0;
 }
 
 static const struct backlight_ops gmux_bl_ops = {
@@ -227,39 +218,32 @@ static const struct backlight_ops gmux_bl_ops = {
 static int __devinit gmux_probe(struct pnp_dev *pnp,
 				const struct pnp_device_id *id)
 {
-	struct apple_gmux_data *gmux_data;
 	struct resource *res;
 	struct backlight_properties props;
 	struct backlight_device *bdev;
 	u8 ver_major, ver_minor, ver_release;
-	acpi_handle dhandle;
 	acpi_status status;
 	int ret = -ENXIO;
-
-	gmux_data = kzalloc(sizeof(*gmux_data), GFP_KERNEL);
-	if (!gmux_data)
-		return -ENOMEM;
-	pnp_set_drvdata(pnp, gmux_data);
 
 	res = pnp_get_resource(pnp, IORESOURCE_IO, 0);
 	if (!res) {
 		pr_err("Failed to find gmux I/O resource\n");
-		goto err_free;
+		goto err_begin;
 	}
 
-	gmux_data->iostart = res->start;
-	gmux_data->iolen = res->end - res->start;
+	gmux_data.iostart = res->start;
+	gmux_data.iolen = res->end - res->start;
 
-	if (gmux_data->iolen < GMUX_MIN_IO_LEN) {
+	if (gmux_data.iolen < GMUX_MIN_IO_LEN) {
 		pr_err("gmux I/O region too small (%lu < %u)\n",
-		       gmux_data->iolen, GMUX_MIN_IO_LEN);
-		goto err_free;
+		       gmux_data.iolen, GMUX_MIN_IO_LEN);
+		goto err_begin;
 	}
 
-	if (!request_region(gmux_data->iostart, gmux_data->iolen,
+	if (!request_region(gmux_data.iostart, gmux_data.iolen,
 			    "Apple gmux")) {
 		pr_err("gmux I/O already in use\n");
-		goto err_free;
+		goto err_begin;
 	}
 
 	/*
@@ -267,9 +251,9 @@ static int __devinit gmux_probe(struct pnp_dev *pnp,
 	 * doesn't really have a gmux. Check for invalid version information
 	 * to detect this.
 	 */
-	ver_major = gmux_read8(gmux_data, GMUX_PORT_VERSION_MAJOR);
-	ver_minor = gmux_read8(gmux_data, GMUX_PORT_VERSION_MINOR);
-	ver_release = gmux_read8(gmux_data, GMUX_PORT_VERSION_RELEASE);
+	ver_major = gmux_read8(GMUX_PORT_VERSION_MAJOR);
+	ver_minor = gmux_read8(GMUX_PORT_VERSION_MINOR);
+	ver_release = gmux_read8(GMUX_PORT_VERSION_RELEASE);
 	if (ver_major == 0xff && ver_minor == 0xff && ver_release == 0xff) {
 		pr_info("gmux device not present\n");
 		ret = -ENODEV;
@@ -281,7 +265,7 @@ static int __devinit gmux_probe(struct pnp_dev *pnp,
 
 	memset(&props, 0, sizeof(props));
 	props.type = BACKLIGHT_PLATFORM;
-	props.max_brightness = gmux_read32(gmux_data, GMUX_PORT_MAX_BRIGHTNESS);
+	props.max_brightness = gmux_read32(GMUX_PORT_MAX_BRIGHTNESS);
 
 	/*
 	 * Currently it's assumed that the maximum brightness is less than
@@ -293,73 +277,67 @@ static int __devinit gmux_probe(struct pnp_dev *pnp,
 		props.max_brightness = GMUX_MAX_BRIGHTNESS;
 
 	bdev = backlight_device_register("gmux_backlight", &pnp->dev,
-					 gmux_data, &gmux_bl_ops, &props);
+					 NULL, &gmux_bl_ops, &props);
 	if (IS_ERR(bdev)) {
 		ret = PTR_ERR(bdev);
 		goto err_release;
 	}
 
-	gmux_data->bdev = bdev;
+	gmux_data.bdev = bdev;
 	bdev->props.brightness = gmux_get_brightness(bdev);
 	backlight_update_status(bdev);
 
-	dhandle = pnp_acpi_device(pnp);
-	if (!dhandle) {
+	gmux_data.dhandle = DEVICE_ACPI_HANDLE(&pnp->dev);
+	if (!gmux_data.dhandle) {
 		pr_err("Cannot find acpi device for pnp device %s\n", dev_name(&pnp->dev));
 		goto err_release;
 	} else {
 		struct acpi_buffer buf = { ACPI_ALLOCATE_BUFFER, NULL };
-		acpi_get_name(dhandle, ACPI_FULL_PATHNAME, &buf);
+		acpi_get_name(gmux_data.dhandle, ACPI_SINGLE_NAME, &buf);
 		pr_info("Found acpi handle for pnp device %s: %s\n", 
 			dev_name(&pnp->dev), (char *)buf.pointer);
 		kfree(buf.pointer);
 	}
 
-    /* TODO: use dhandle? */
-	status = acpi_install_gpe_handler(NULL, 0x16, ACPI_GPE_LEVEL_TRIGGERED, &gmux_gpe_handler, dhandle);
+	status = acpi_install_notify_handler(gmux_data.dhandle, ACPI_DEVICE_NOTIFY, &gmux_notify_handler, pnp);
 	if (ACPI_FAILURE(status)) {
-		printk("Install gpe handler failed: %s\n", acpi_format_exception(status));
-		goto err_release;
+		printk("Install notify handler failed: %s\n", acpi_format_exception(status));
+		goto err_notify;
 	}
 
-	status = acpi_enable_gpe(NULL, 0x16);
-	if (ACPI_FAILURE(status)) {
-		pr_err("Enable gpe failed: %s\n", acpi_format_exception(status));
-		goto err_enable_gpe;
-	}
-
-	/* HACK */
-	gmux_sdata = gmux_data;
-	
 	if (vga_switcheroo_register_handler(&gmux_handler))
-		goto err_switcheroo;
+		goto err_register;
 
+	init_completion(&powerchange_done);
 	gmux_enable_interrupts();
 
 	return 0;
 
-err_switcheroo:
-	acpi_remove_gpe_handler(NULL, 0x16, &gmux_gpe_handler);
-err_enable_gpe:
+err_register:
+	status = acpi_remove_notify_handler(gmux_data.dhandle, ACPI_DEVICE_NOTIFY, &gmux_notify_handler);
+	if (ACPI_FAILURE(status)) {
+		printk("Install notify handler failed: %s\n", acpi_format_exception(status));
+	}
+err_notify:
 	backlight_device_unregister(bdev);
 err_release:
-	release_region(gmux_data->iostart, gmux_data->iolen);
-err_free:
-	kfree(gmux_data);
+	release_region(gmux_data.iostart, gmux_data.iolen);
+err_begin:
 	return ret;
 }
 
 static void __devexit gmux_remove(struct pnp_dev *pnp)
 {
-	struct apple_gmux_data *gmux_data = pnp_get_drvdata(pnp);
+	acpi_status status;
 
 	vga_switcheroo_unregister_handler();
-	backlight_device_unregister(gmux_data->bdev);
+	backlight_device_unregister(gmux_data.bdev);
 	gmux_disable_interrupts();
-	acpi_remove_gpe_handler(NULL, 0x16, &gmux_gpe_handler);
-	acpi_disable_gpe(NULL, 0x16);
-	release_region(gmux_data->iostart, gmux_data->iolen);
-	kfree(gmux_data);
+	status = acpi_remove_notify_handler(gmux_data.dhandle, ACPI_DEVICE_NOTIFY, &gmux_notify_handler);
+	if (ACPI_FAILURE(status)) {
+		printk("Install notify handler failed: %s\n", acpi_format_exception(status));
+	}
+	release_region(gmux_data.iostart, gmux_data.iolen);
 }
 
 static const struct pnp_device_id gmux_device_ids[] = {
