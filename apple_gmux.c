@@ -20,10 +20,13 @@
 #include <linux/pci.h>
 #include <linux/vga_switcheroo.h>
 
+#include <linux/delay.h>
+
 static struct apple_gmux_data {
 	unsigned long iostart;
 	unsigned long iolen;
 	acpi_handle dhandle;
+	enum vga_switcheroo_client_id resume_client_id;
 
 	struct backlight_device *bdev;
 } gmux_data;
@@ -115,23 +118,69 @@ static int gmux_switchto(enum vga_switcheroo_client_id id)
 	return 0;
 }
 
+static int gmux_switchddc(enum vga_switcheroo_client_id id)
+{
+	if (id == VGA_SWITCHEROO_IGD) {
+		pr_info("switch ddc to IGD\n");
+		gmux_write8(GMUX_PORT_SWITCH_DDC, 1);
+	} else {
+		pr_info("switch ddc to DIS\n");
+		gmux_write8(GMUX_PORT_SWITCH_DDC, 2);
+	}
+
+	return 0;
+}
+
+static int gmux_call_acpi_pwrd(int arg)
+{
+	// TODO: don't hardcode this
+	const char *method = "\\_SB_.PCI0.P0P2.GFX0.PWRD";
+	acpi_handle pwrd_handle = NULL;
+	acpi_status status = AE_OK;
+	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object arg0 = { ACPI_TYPE_INTEGER };
+	struct acpi_object_list arg_list = { 1, &arg0 };
+
+	status = acpi_get_handle(NULL, (acpi_string) method, &pwrd_handle);
+	if (ACPI_FAILURE(status)) {
+		pr_err("Cannot get PWRD handle: %s\n", acpi_format_exception(status));
+		return -ENODEV;
+	}
+
+	arg0.integer.value = arg;
+
+	status = acpi_evaluate_object(pwrd_handle, NULL, &arg_list, &buffer);
+	if (ACPI_FAILURE(status)) {
+		pr_err("PWRD call failed: %s\n", acpi_format_exception(status));
+		return -ENODEV;
+	}
+
+	//acpi_result_to_string(buffer.pointer);
+	kfree(buffer.pointer);
+
+	pr_info("PWRD call successful\n");
+	return 0;
+}
+
 static int gmux_set_discrete_state(enum vga_switcheroo_state state)
 {
 	/* TODO: locking for completions needed? */
 	init_completion(&powerchange_done);
 
 	if (state == VGA_SWITCHEROO_ON) {
+		gmux_call_acpi_pwrd(0);
 		gmux_write8(GMUX_PORT_DISCRETE_POWER, 1);
 		gmux_write8(GMUX_PORT_DISCRETE_POWER, 3);
 		pr_info("discrete card powered up\n");
 	} else {
 		gmux_write8(GMUX_PORT_DISCRETE_POWER, 1);
 		gmux_write8(GMUX_PORT_DISCRETE_POWER, 0);
+		gmux_call_acpi_pwrd(1);
 		pr_info("discrete card powered down\n");
 	}
 
 	if (wait_for_completion_interruptible_timeout(&powerchange_done, msecs_to_jiffies(200)))
-		pr_info("completion timeout, \n");
+		pr_info("completion timeout\n");
 
 	return 0;
 }
@@ -152,14 +201,19 @@ static int gmux_init(void)
 
 static int gmux_get_client_id(struct pci_dev *pdev)
 {
-	if (pdev->vendor == 0x8086) /* TODO: better detection, see bbswitch */
+	/* early mbps with switchable graphics use nvidia integrated graphics,
+	 * hardcode that the 9400M is integrated */
+	if (pdev->vendor == PCI_VENDOR_ID_INTEL)
 		return VGA_SWITCHEROO_IGD;
-	else
+	else if (pdev->vendor == PCI_VENDOR_ID_NVIDIA && pdev->device == 0x0863)
+		return VGA_SWITCHEROO_IGD;
+	else 
 		return VGA_SWITCHEROO_DIS;
 }
 
 static struct vga_switcheroo_handler gmux_handler = {
 	.switchto = gmux_switchto,
+	.switchddc = gmux_switchddc,
 	.power_state = gmux_set_power_state,
 	.init = gmux_init,
 	.get_client_id = gmux_get_client_id,
@@ -214,6 +268,19 @@ static const struct backlight_ops gmux_bl_ops = {
 	.get_brightness = gmux_get_brightness,
 	.update_status = gmux_update_status,
 };
+
+static int gmux_suspend(struct pnp_dev *dev, pm_message_t state)
+{
+	gmux_data.resume_client_id = gmux_read8(GMUX_PORT_SWITCH_DISPLAY) == 2 ?
+		VGA_SWITCHEROO_IGD : VGA_SWITCHEROO_DIS;
+	return 0;
+}
+
+static int gmux_resume(struct pnp_dev *dev)
+{
+	gmux_switchto(gmux_data.resume_client_id);
+	return 0;
+}
 
 static int __devinit gmux_probe(struct pnp_dev *pnp,
 				const struct pnp_device_id *id)
@@ -311,6 +378,11 @@ static int __devinit gmux_probe(struct pnp_dev *pnp,
 	init_completion(&powerchange_done);
 	gmux_enable_interrupts();
 
+	/* TODO: check this out */
+	/*active_card = gmux_read8(GMUX_PORT_SWITCH_GET_DISPLAY);*/
+	/*pr_info("active card: %x\n", active_card);*/
+	/*pr_info("rom shadow: %x %d", pdev->vendor, pdev->resource[PCI_ROM_RESOURCE].flags & IORESOURCE_ROM_SHADOW);*/
+
 	return 0;
 
 err_register:
@@ -350,6 +422,8 @@ static struct pnp_driver gmux_pnp_driver = {
 	.probe		= gmux_probe,
 	.remove		= __devexit_p(gmux_remove),
 	.id_table	= gmux_device_ids,
+	.suspend	= gmux_suspend,
+	.resume		= gmux_resume
 };
 
 static int __init apple_gmux_init(void)
