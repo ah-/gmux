@@ -31,6 +31,8 @@ static struct apple_gmux_data {
 	struct backlight_device *bdev;
 } gmux_data;
 
+static struct pci_dev *discrete;
+
 DECLARE_COMPLETION(powerchange_done);
 
 /*
@@ -145,17 +147,17 @@ static int gmux_switchddc(enum vga_switcheroo_client_id id)
 
 static int gmux_call_acpi_pwrd(int arg)
 {
-	// TODO: don't hardcode this
-	// access directly
-	/*DEVICE_ACPI_HANDLE(&vgasr_priv.clients[blah].pdev->dev)*/
-	const char *method = "\\_SB_.PCI0.P0P2.GFX0.PWRD";
+	acpi_handle gfx_handle;
 	acpi_handle pwrd_handle = NULL;
 	acpi_status status = AE_OK;
 	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
 	union acpi_object arg0 = { ACPI_TYPE_INTEGER };
 	struct acpi_object_list arg_list = { 1, &arg0 };
 
-	status = acpi_get_handle(NULL, (acpi_string) method, &pwrd_handle);
+	/*gfx_handle = acpi_get_child(DEVICE_ACPI_HANDLE(&discrete->dev), 0);*/
+	gfx_handle = DEVICE_ACPI_HANDLE(&discrete->dev);
+	pr_info("gfx_handle: %x\n", gfx_handle);
+	status = acpi_get_handle(gfx_handle, "PWRD", &pwrd_handle);
 	if (ACPI_FAILURE(status)) {
 		pr_err("Cannot get PWRD handle: %s\n", acpi_format_exception(status));
 		return -ENODEV;
@@ -226,12 +228,14 @@ static int gmux_get_client_id(struct pci_dev *pdev)
 
 	/* early mbps with switchable graphics use nvidia integrated graphics,
 	 * hardcode that the 9400M is integrated */
-	if (pdev->vendor == PCI_VENDOR_ID_INTEL)
+	if (pdev->vendor == PCI_VENDOR_ID_INTEL) {
 		return VGA_SWITCHEROO_IGD;
-	else if (pdev->vendor == PCI_VENDOR_ID_NVIDIA && pdev->device == 0x0863)
+	} else if (pdev->vendor == PCI_VENDOR_ID_NVIDIA && pdev->device == 0x0863) {
 		return VGA_SWITCHEROO_IGD;
-	else 
+	} else {
+		discrete = pdev;
 		return VGA_SWITCHEROO_DIS;
+	}
 }
 
 static struct vga_switcheroo_handler gmux_handler = {
