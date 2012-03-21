@@ -105,6 +105,12 @@ static int gmux_update_status(struct backlight_device *bd)
 
 static int gmux_switchto(enum vga_switcheroo_client_id id)
 {
+	u8 active_card;
+
+	/* TODO: check this out */
+	active_card = gmux_read8(GMUX_PORT_SWITCH_GET_DISPLAY);
+	pr_info("active card before: %x\n", active_card);
+
 	if (id == VGA_SWITCHEROO_IGD) {
 		gmux_write8(GMUX_PORT_SWITCH_DDC, 1);
 		gmux_write8(GMUX_PORT_SWITCH_DISPLAY, 2);
@@ -114,6 +120,12 @@ static int gmux_switchto(enum vga_switcheroo_client_id id)
 		gmux_write8(GMUX_PORT_SWITCH_DISPLAY, 3);
 		gmux_write8(GMUX_PORT_SWITCH_EXTERNAL, 3);
 	}
+
+	/* TODO: check this out */
+	active_card = gmux_read8(GMUX_PORT_SWITCH_GET_DISPLAY);
+	pr_info("active card after: %x\n", active_card);
+
+
 
 	return 0;
 }
@@ -134,6 +146,8 @@ static int gmux_switchddc(enum vga_switcheroo_client_id id)
 static int gmux_call_acpi_pwrd(int arg)
 {
 	// TODO: don't hardcode this
+	// access directly
+	/*DEVICE_ACPI_HANDLE(&vgasr_priv.clients[blah].pdev->dev)*/
 	const char *method = "\\_SB_.PCI0.P0P2.GFX0.PWRD";
 	acpi_handle pwrd_handle = NULL;
 	acpi_status status = AE_OK;
@@ -201,6 +215,15 @@ static int gmux_init(void)
 
 static int gmux_get_client_id(struct pci_dev *pdev)
 {
+	pr_info("get client id rom shadow: %x %d", pdev->vendor, pdev->resource[PCI_ROM_RESOURCE].flags & IORESOURCE_ROM_SHADOW);
+	if (pdev->vendor == PCI_VENDOR_ID_INTEL) {
+		pdev->resource[PCI_ROM_RESOURCE].flags &= ~IORESOURCE_ROM_SHADOW;
+		dev_printk(KERN_DEBUG, &pdev->dev, "not boot video device\n");
+	} else {
+		pdev->resource[PCI_ROM_RESOURCE].flags |= IORESOURCE_ROM_SHADOW;
+		dev_printk(KERN_DEBUG, &pdev->dev, "boot video device\n");
+	}
+
 	/* early mbps with switchable graphics use nvidia integrated graphics,
 	 * hardcode that the 9400M is integrated */
 	if (pdev->vendor == PCI_VENDOR_ID_INTEL)
@@ -271,6 +294,7 @@ static const struct backlight_ops gmux_bl_ops = {
 
 static int gmux_suspend(struct pnp_dev *dev, pm_message_t state)
 {
+	pr_info("gmux: suspend\n");
 	gmux_data.resume_client_id = gmux_read8(GMUX_PORT_SWITCH_DISPLAY) == 2 ?
 		VGA_SWITCHEROO_IGD : VGA_SWITCHEROO_DIS;
 	return 0;
@@ -278,6 +302,7 @@ static int gmux_suspend(struct pnp_dev *dev, pm_message_t state)
 
 static int gmux_resume(struct pnp_dev *dev)
 {
+	pr_info("gmux: resume\n");
 	gmux_switchto(gmux_data.resume_client_id);
 	return 0;
 }
@@ -377,11 +402,6 @@ static int __devinit gmux_probe(struct pnp_dev *pnp,
 
 	init_completion(&powerchange_done);
 	gmux_enable_interrupts();
-
-	/* TODO: check this out */
-	/*active_card = gmux_read8(GMUX_PORT_SWITCH_GET_DISPLAY);*/
-	/*pr_info("active card: %x\n", active_card);*/
-	/*pr_info("rom shadow: %x %d", pdev->vendor, pdev->resource[PCI_ROM_RESOURCE].flags & IORESOURCE_ROM_SHADOW);*/
 
 	return 0;
 
